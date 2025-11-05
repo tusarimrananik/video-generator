@@ -46,4 +46,3 @@ def generate_audio(
     # Merge chunks into one file
     final_audio = sum(all_chunks)
     final_audio.export(output_file, format="wav")
-
