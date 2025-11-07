@@ -2,37 +2,35 @@ from __future__ import annotations
 from pathlib import Path
 
 
-def generate_subtitles(
-    audio_path: str | Path,
-    ass_out_path: str | Path,
-    *,
-    text_to_align: str,
-    lang: str = "en",
-    device: str = "cpu",
-    playres_w: int = 1080,
-    playres_h: int = 1920,
-    font: str = "DejaVu Sans Mono",
-    fontsize: int = 54,
-    primary_color: str = "&H00FFFFFF",
-    outline_color: str = "&H00111111",
-    alignment: int = 5,
-    margin_l: int = 60,
-    margin_r: int = 60,
-    margin_v: int = 40,
-    highlight_bg_color: str = "&H8033CCFF",
-    highlight_text_color: str = "&H00000000",
-) -> Path:
+def generate_subtitles() -> Path:
     import os
+    import json
     from typing import List
     from pydub import AudioSegment
     import whisperx  # type: ignore
 
-    # WhisperX and PyTorch automatically look for checkpoints in TORCH_HOME/hub/checkpoints.
-    # By setting TORCH_HOME to your project's "models" folder, we make WhisperX treat:
-    # models/hub/checkpoints/wav2vec2_fairseq_base_ls960_asr_ls960.pth
-    # as its official local checkpoint. It will *not* search .cache or Hugging Face.
-    # The two environment variables below disable all online model fetching.
+    # --- Prevent Windows crash ---
+    os.environ["TRANSFORMERS_NO_TORCHVISION"] = "1"
+    os.environ["TORCHVISION_DISABLE_NMS_EXPORT"] = "1"
+
+    # --- Default Paths ---
     models_root = Path("models").resolve()
+    json_path = Path("assets/info/story_image_prompts.json")
+    audio_path = Path("assets/audio/generated/output.wav")
+    ass_out_path = Path("assets/subtitles/output.ass")
+
+    # --- Load story text ---
+    if not json_path.exists():
+        raise FileNotFoundError(f"JSON file not found: {json_path}")
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    story_lines = data.get("story", [])
+    if not story_lines or not isinstance(story_lines, list):
+        raise ValueError(f"'story' key missing or empty in {json_path}")
+    text_to_align = " ".join(line.strip() for line in story_lines if line.strip())
+
+    # --- Check model checkpoint ---
     ckpt = (
         models_root
         / "hub"
@@ -46,18 +44,30 @@ def generate_subtitles(
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
-    ass_out_path = Path(ass_out_path)
-    ass_out_path.parent.mkdir(parents=True, exist_ok=True)
+    # --- Subtitle appearance defaults ---
+    playres_w = 1080
+    playres_h = 1920
+    font = "DejaVu Sans Mono"
+    fontsize = 54
+    primary_color = "&H00FFFFFF"
+    outline_color = "&H00111111"
+    alignment = 5
+    margin_l = 60
+    margin_r = 60
+    margin_v = 40
+    highlight_bg_color = "&H8033CCFF"
+    highlight_text_color = "&H00000000"
 
+    # --- Prepare audio and segments ---
+    ass_out_path.parent.mkdir(parents=True, exist_ok=True)
     duration_s = AudioSegment.from_file(audio_path).duration_seconds
     segments = [{"start": 0.0, "end": duration_s, "text": text_to_align}]
 
-    align_model, metadata = whisperx.load_align_model(
-        language_code=lang,
-        device=device,
-    )
-    aligned = whisperx.align(segments, align_model, metadata, str(audio_path), device)
+    # --- Align text with WhisperX ---
+    align_model, metadata = whisperx.load_align_model(language_code="en", device="cpu")
+    aligned = whisperx.align(segments, align_model, metadata, str(audio_path), "cpu")
 
+    # --- Helper functions ---
     def fmt_time(t: float) -> str:
         if t < 0:
             t = 0.0
@@ -81,6 +91,7 @@ def generate_subtitles(
     def q2(text: str) -> str:
         return r"{\q2}" + text
 
+    # --- ASS file header ---
     header = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
@@ -100,11 +111,11 @@ def generate_subtitles(
 
     lines: List[str] = [header]
 
+    # --- Write subtitles ---
     for seg in aligned.get("segments", []):
         words = [w for w in seg.get("words", []) if has_times(w)]
         if not words:
             continue
-
         display_tokens = [
             str(w.get("word", "")).strip()
             for w in words
@@ -115,7 +126,6 @@ def generate_subtitles(
             lines.append(
                 f"Dialogue:0,{fmt_time(seg['start'])},{fmt_time(seg['end'])},Base,,{margin_l},{margin_r},{margin_v},,{q2(esc(base_text))}\n"
             )
-
         for i, w in enumerate(words):
             token = str(w.get("word", "")).strip()
             if not token:
@@ -127,4 +137,5 @@ def generate_subtitles(
             )
 
     ass_out_path.write_text("".join(lines), encoding="utf-8")
+    print(f"✅ Subtitles generated successfully: {ass_out_path.resolve()}")
     return ass_out_path

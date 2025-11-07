@@ -1,4 +1,4 @@
-# shorts_slideshow.py
+# scripts/build_video.py
 from __future__ import annotations
 
 import math
@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence, Union, List, Optional
 
-from moviepy.editor import (
+# MoviePy v2 import style (no "moviepy.editor")
+from moviepy import (
     ImageClip,
     AudioFileClip,
     CompositeVideoClip,
@@ -17,15 +18,21 @@ from moviepy.editor import (
 
 PathLike = Union[str, Path]
 
+# ===== Defaults =====
+IMAGE_DIR = Path("assets/images")
+AUDIO_PATH = Path("assets/audio/generated/output.wav")
+OUTPUT_DIR = Path("assets/video")
+OUTPUT_PATH = OUTPUT_DIR / "output.mp4"
+
 
 # ==================== CONFIG ====================
 @dataclass
 class SlideshowParams:
     target_w: int = 1080
     target_h: int = 1920
-    fps: int = 30                         # looks smoother for shorts
+    fps: int = 30                    # smoother for shorts
     min_per_image: float = 3.0
-    whip_max: float = 0.45                # max crossfade duration cap
+    whip_max: float = 0.45           # max crossfade duration cap
 
     # Look / motion
     contrast: float = 1.08
@@ -39,14 +46,23 @@ class SlideshowParams:
     global_fade_in_frac: float = 0.15
     global_fade_out_frac: float = 0.12
 
-    # Robustness against edge artifacts / black bars:
-    # - Slightly overscale the "cover" fit so we're always >= canvas by a hair.
-    # - Use ceil() per-frame when resizing so rounding never under-fills.
-    overscan: float = 1.003               # ~0.3% larger than canvas after "cover"
-    safety_min_body: float = 0.4          # min visible body per image (ex-fade)
+    # Robustness against edge artifacts / black bars
+    overscan: float = 1.003          # ~0.3% overscale
+    safety_min_body: float = 0.4     # min visible body per image (ex-fade)
 
 
 # ==================== HELPERS ====================
+def _collect_images(dir_path: PathLike) -> List[Path]:
+    p = Path(dir_path)
+    if not p.exists() or not p.is_dir():
+        raise FileNotFoundError(f"Image directory not found: {dir_path}")
+    exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
+    files = sorted([q for q in p.iterdir() if q.suffix.lower() in exts])
+    if not files:
+        raise ValueError(f"No images found in: {dir_path}")
+    return files
+
+
 def sample_evenly(seq: Sequence, k: int) -> List:
     n = len(seq)
     if n == 0:
@@ -90,18 +106,17 @@ def _make_clip(
     idx: int,
     p: SlideshowParams,
 ) -> VideoClip:
-    """
-    Create a center-anchored Ken Burns zoom clip from one image,
-    robust to rounding so no black bars appear.
-    """
-    base0 = ImageClip(str(img_path)).set_duration(duration)
+    """Create a center-anchored Ken Burns zoom clip from one image."""
+    base0 = ImageClip(str(img_path)).with_duration(duration)
 
-    # "Cover" fit + small overscan so the image is *guaranteed* to exceed canvas
+    # "Cover" fit + small overscan so the image always exceeds the canvas
     cover_scale = max(p.target_w / base0.w, p.target_h / base0.h) * p.overscan
-    base = base0.resize(cover_scale)
+    base = base0.resized(cover_scale)  # v2: resized()
 
-    # Subtle contrast pop
-    base = base.fx(vfx.lum_contrast, lum=0, contrast=p.contrast, contrast_thr=128)
+    # Subtle contrast pop (v2: with_effects + class-based fx)
+    base = base.with_effects([
+        vfx.LumContrast(lum=0, contrast=p.contrast, contrast_threshold=128)
+    ])
 
     def z_func(t: float) -> float:
         prog = t / max(duration, 1e-6)
@@ -109,23 +124,22 @@ def _make_clip(
         z_end = p.zoom_end_even if (idx % 2 == 0) else p.zoom_end_odd
         return p.zoom_start + (z_end - p.zoom_start) * e
 
-    # IMPORTANT: return *integer (w,h)* with ceil to avoid rounding underfill
+    # IMPORTANT: integer (w,h) with ceil avoids rounding underfill/black bars
     def size_func(t: float):
         z = z_func(t)
         w = int(math.ceil(base.w * z))
         h = int(math.ceil(base.h * z))
         return (w, h)
 
-    zoomed = base.resize(size_func).set_position("center")
+    zoomed = base.resized(size_func).with_position("center")  # v2: resized()
 
-    # Center composite at final target size; zoomed always covers due to overscan+ceil
     comp = CompositeVideoClip([zoomed], size=(p.target_w, p.target_h))
-    comp = comp.set_duration(duration)
+    comp = comp.with_duration(duration)
     return comp
 
 
-# ==================== MAIN BUILDER ====================
-def build_video(
+# ==================== CORE BUILDER ====================
+def _build_video_core(
     image_paths: Sequence[PathLike],
     audio_clip: AudioFileClip,
     params: Optional[SlideshowParams] = None,
@@ -150,27 +164,23 @@ def build_video(
 
         gi = min(p.global_fade_in_cap, per_img_final * p.global_fade_in_frac)
         go = min(p.global_fade_out_cap, per_img_final * p.global_fade_out_frac)
-        try:
-            video = video.fadein(gi).fadeout(go)
-        except AttributeError:
-            video = video.fx(vfx.fadein, gi).fx(vfx.fadeout, go)
+        video = video.with_effects([vfx.FadeIn(gi), vfx.FadeOut(go)])
 
         total_quant = quantize_time_to_frame(total_audio, p.fps)
-        return video.set_audio(audio_clip).set_duration(total_quant)
+        return video.with_audio(audio_clip).with_duration(total_quant)
 
     # Multi-image slideshow
     per_img_naive = total_audio / n
     xfade = safe_xfade(per_img_naive, p.fps, p.whip_max)
 
-    # In an overlap-based concat, each interior clip contributes (per_img_final - xfade) visible seconds.
-    # Solve for per_img_final so total length matches the audio length.
+    # In overlap concat, each interior clip contributes (per_img_final - xfade)
     per_img_final = (total_audio + (n - 1) * xfade) / n
     per_img_final = quantize_time_to_frame(per_img_final, p.fps)
     xfade = quantize_time_to_frame(xfade, p.fps)
 
     min_body = max(p.safety_min_body, 2.0 / p.fps)
     if per_img_final <= xfade + min_body:
-        # dial back crossfade (framewise) until body is safe
+        # dial back crossfade until body is safe
         xfade_frames = int(max(0, round(xfade * p.fps)))
         while per_img_final <= (xfade_frames / p.fps) + min_body and xfade_frames > 0:
             xfade_frames -= 1
@@ -181,66 +191,55 @@ def build_video(
     ]
 
     if xfade > 0:
-        # Crossfade-in every clip except the very first
-        clips = [base_clips[0]] + [c.crossfadein(xfade) for c in base_clips[1:]]
+        # Apply CrossFadeIn to all but the first clip (v2: with_effects)
+        clips = [base_clips[0]] + [
+            c.with_effects([vfx.CrossFadeIn(xfade)]) for c in base_clips[1:]
+        ]
         video = concatenate_videoclips(clips, method="compose", padding=-xfade)
     else:
         video = concatenate_videoclips(base_clips, method="compose")
 
     gi = min(p.global_fade_in_cap, per_img_final * p.global_fade_in_frac)
     go = min(p.global_fade_out_cap, per_img_final * p.global_fade_out_frac)
-    try:
-        video = video.fadein(gi).fadeout(go)
-    except AttributeError:
-        video = video.fx(vfx.fadein, gi).fx(vfx.fadeout, go)
+    video = video.with_effects([vfx.FadeIn(gi), vfx.FadeOut(go)])
 
     total_quant = quantize_time_to_frame(total_audio, p.fps)
-    return video.set_audio(audio_clip).set_duration(total_quant)
+    return video.with_audio(audio_clip).with_duration(total_quant)
 
 
-# ==================== CONVENIENCE WRAPPERS ====================
-def build_video_from_paths(
-    image_paths: Sequence[PathLike],
-    audio_path: PathLike,
-    params: Optional[SlideshowParams] = None,
-) -> VideoClip:
-    audio = AudioFileClip(str(audio_path))
-    return build_video(image_paths, audio, params)
+# ==================== PUBLIC API (writes file) ====================
+def build_video() -> str:
+    """
+    Build the slideshow from defaults and write to assets/video/output.mp4.
+    Returns the output path as a string.
+    """
+    images = _collect_images(IMAGE_DIR)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-
-def render_to_file(
-    image_paths: Sequence[PathLike],
-    audio: Union[PathLike, AudioFileClip],
-    out_path: PathLike,
-    params: Optional[SlideshowParams] = None,
-    *,
-    codec: str = "libx264",
-    audio_codec: str = "aac",
-    preset: str = "medium",
-    threads: int = 4,
-    bitrate: str = "8000k",
-    pix_fmt: str = "yuv420p",  # safest for phone players
-) -> None:
-    must_close = False
-    if isinstance(audio, (str, Path)):
-        audio_clip = AudioFileClip(str(audio))
-        must_close = True
-    else:
-        audio_clip = audio
-
+    audio_clip = AudioFileClip(str(AUDIO_PATH))
     try:
-        p = params or SlideshowParams()
-        video = build_video(image_paths, audio_clip, p)
-        video.write_videofile(
-            str(out_path),
-            fps=p.fps,
-            codec=codec,
-            audio_codec=audio_codec,
-            preset=preset,
-            threads=threads,
-            bitrate=bitrate,
-            ffmpeg_params=["-pix_fmt", pix_fmt],
-        )
+        video = _build_video_core(images, audio_clip, SlideshowParams())
+        try:
+            video.write_videofile(
+                str(OUTPUT_PATH),
+                fps=SlideshowParams().fps,
+                codec="libx264",
+                audio_codec="aac",
+                preset="medium",
+                threads=4,
+                bitrate="8000k",
+                ffmpeg_params=["-pix_fmt", "yuv420p"],  # safest for phone players
+            )
+        finally:
+            try:
+                video.close()
+            except Exception:
+                pass
     finally:
-        if must_close:
-            audio_clip.close()
+        audio_clip.close()
+
+    return str(OUTPUT_PATH)
+
+
+if __name__ == "__main__":
+    print(build_video())

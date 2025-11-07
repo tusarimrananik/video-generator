@@ -1,17 +1,24 @@
-# Core TTS engine
-TTS==0.22.0
-
-# Deep learning frameworks
+# ----- Core Deep Learning -----
 torch==2.5.1
+torchvision==0.20.1
 torchaudio==2.5.1
 
-# Audio handling
+# ----- Transformers / NLP -----
+transformers==4.44.2
+nltk>=3.9
+
+# ----- Coqui TTS (XTTS v2) -----
+TTS==0.22.0
+
+# ----- WhisperX (alignment / subtitles) -----
+whisperx
+
+# ----- Audio Handling -----
 pydub==0.25.1
 soundfile==0.12.1
-
-# Optional but recommended
+librosa==0.10.1
 numpy>=1.26.0
 scipy>=1.11.0
 
-# If you use sentence splitting or NLP features from TTS
-nltk>=3.9
+# ----- Optional quality-of-life -----
+numba
