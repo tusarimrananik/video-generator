@@ -16,6 +16,34 @@ from datetime import datetime
 # =========================
 # Config (edit these only)
 # =========================
+
+GLOBAL_ID = (
+    "[GLOBAL_IDENTITY]\n"
+    "Scope: Works for any story, genre, or locale; respectful, non-stereotyped depictions.\n"
+    "Setting-lock: keep world cues consistent across an image series—geography/landforms, climate/season, architecture, signage/typography, vehicles/gear, materials, ambient sound/lighting cues.\n"
+    "Era-lock: preserve implied time period and technology level unless explicitly changed.\n"
+    "Palette-lock: maintain a coherent palette and mood for the series (e.g., muted cold blues, warm tungsten interiors).\n"
+    "Do-not-change: established setting-lock motifs and layout language; avoid anachronistic skylines or props without instruction.\n"
+    "Visual physics: coherent light direction, natural textures, believable scale; no collage or multi-panel layouts.\n"
+    "Camera-lock (default): 35mm natural-light look, shallow depth of field, aspect ratio 3:2, subtle film grain. (May be overridden by explicit camera/style requests.)\n"
+)
+
+STYLE_WATERCOLOR = (
+    "[STYLE_MODULE: watercolor]\n"
+    "Transparent washes, visible paper texture, soft edges, pooled pigments at contours, limited palette with indigo/teal accents.\n"
+)
+STYLE_REALISTIC = (
+    "[STYLE_MODULE: realistic]\n"
+    "Soft documentary realism, natural muted palette, gentle haze, true-to-life textures, no plastic sheen.\n"
+)
+STYLE_CARTOON = (
+    "[STYLE_MODULE: cartoon]\n"
+    "Clean cel-shading, bold outlines, flat color blocks, gentle gradients for sky/water, expressive but not exaggerated faces.\n"
+)
+
+CHOSEN_STYLE = STYLE_CARTOON  # or STYLE_REALISTIC / STYLE_CARTOON per run
+
+
 PROFILE_DIR = r"C:\MyChromeProfile"  # reuse your signed-in Chrome profile
 PROMPTS_JSON = "assets/info/story_image_prompts.json"
 OUTPUT_DIR = "output_images"
@@ -384,32 +412,6 @@ def main(headless=False):
 
             # Type and submit the prompt
 
-            GLOBAL_ID = (
-                "[GLOBAL_IDENTITY]\n"
-                "Meera-01: widowed librarian, late 50s, South Asian, oval face, medium-brown skin, silver-streaked black hair in a low bun, thin spectacles, small gold nose stud; calm and caring.\n"
-                "Wardrobe-lock: wool shawl with a thin red edge, sea-blue cotton sari, worn leather sandals.\n"
-                "Signature props: weathered field notebook, brass thermometer, chipped blue enamel mug.\n"
-                "Ravi-01: young fisherman, mid 20s, lean, sun-browned skin, short wavy black hair, faint stubble; practical and kind.\n"
-                "Wardrobe-lock: faded teal kurta, dark lungi, old rope bracelet.\n"
-                "Setting-lock: misty South Asian coastal town, wooden pier, lotus-edged shore, hand-painted signs, no modern skyline.\n"
-                "Do-not-change: faces, ages, skin tones, hair styles, wardrobe-lock items, boat and signs styling; consistent across images.\n"
-                "Camera-lock: 35mm natural-light look, shallow depth of field, aspect ratio 3:2, subtle film grain.\n"
-            )
-            STYLE_WATERCOLOR = (
-                "[STYLE_MODULE: watercolor]\n"
-                "Transparent washes, visible paper texture, soft edges, pooled pigments at contours, limited palette with indigo/teal accents.\n"
-            )
-            STYLE_REALISTIC = (
-                "[STYLE_MODULE: realistic]\n"
-                "Soft documentary realism, natural muted palette, gentle haze, true-to-life textures, no plastic sheen.\n"
-            )
-            STYLE_CARTOON = (
-                "[STYLE_MODULE: cartoon]\n"
-                "Clean cel-shading, bold outlines, flat color blocks, gentle gradients for sky/water, expressive but not exaggerated faces.\n"
-            )
-
-            CHOSEN_STYLE = STYLE_CARTOON  # or STYLE_REALISTIC / STYLE_CARTOON per run
-
             msg = (
                 (
                     GLOBAL_ID
@@ -501,7 +503,7 @@ def main(headless=False):
             time.sleep(0.6)
 
         # Final pass: normalize names to exactly 01..NN.ext
-        # ensure_sequential_names(root_dir, expected_n, pad_width)
+        ensure_sequential_names(root_dir, expected_n, pad_width)
 
     finally:
         if driver is not None:
