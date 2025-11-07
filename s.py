@@ -10,38 +10,60 @@ import os
 import re
 import time
 import json
+import shutil
 from datetime import datetime
-import argparse  # CHANGE: CLI flags for headless on/off
-import shutil  # add this at the top of your file
+
+# =========================
+# Config (edit these only)
+# =========================
+PROFILE_DIR = r"C:\MyChromeProfile"  # reuse your signed-in Chrome profile
+PROMPTS_JSON = "assets/info/story_image_prompts.json"
+OUTPUT_DIR = "output_images"
+MAX_PROMPTS = 15
+HEADLESS = False  # <--- switch here (True = headless, False = headful)
+
+# =========================
+# Helpers
+# =========================
 
 
-# ---------- Helpers ----------
-
-
-# This will load promopts and maximum of 6 prompts.
-def load_prompts(path="assets/info/story_image_prompts.json", max_count=6):
-    with open(path, "r") as f:
+def load_prompts(path=PROMPTS_JSON, max_count=MAX_PROMPTS):
+    """Load up to max_count prompts from a JSON file under 'image_prompts'."""
+    with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     prompts = data.get("image_prompts", [])
     return prompts[:max_count]
 
 
-# --- build_driver: add a download_dir argument and prefs ---
-
-
-# this is setting the browser settings, like user profile, where to download files etc...
-def build_driver(headless=False, download_dir=None):  # CHANGE
+def build_driver(headless=False, download_dir=None):
+    """
+    Create a Chrome driver configured to look like a real browser,
+    reuse an existing profile, and save downloads to download_dir.
+    """
     options = Options()
-    options.add_argument(r"user-data-dir=C:\MyChromeProfile")
+    options.add_argument(f"user-data-dir={PROFILE_DIR}")
+    options.add_argument("--profile-directory=Default")
+    options.add_argument("--window-size=1920,1080")
     options.add_argument("--start-maximized")
+
+    # Reduce obvious automation fingerprints
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
     options.add_experimental_option("detach", False)
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument(
+        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/129.0.0.0 Safari/537.36"
+    )
+    options.add_argument("--lang=en-US,en;q=0.9")
+
     if headless:
         options.add_argument("--headless=new")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
 
-    # Force Chrome to use our download directory
-    if download_dir:  # CHANGE
+    if download_dir:
         download_dir = os.path.abspath(download_dir)
         prefs = {
             "download.default_directory": download_dir,
@@ -51,10 +73,25 @@ def build_driver(headless=False, download_dir=None):  # CHANGE
         }
         options.add_experimental_option("prefs", prefs)
 
-    service = Service()
-    drv = webdriver.Chrome(service=service, options=options)
+    drv = webdriver.Chrome(service=Service(), options=options)
 
-    # Strongly nudge via CDP (Browser first, then Page)  # CHANGE
+    # Stealth tweaks injected before any document loads
+    try:
+        drv.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {
+                "source": """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+window.chrome = window.chrome || { runtime: {} };
+Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
+            """
+            },
+        )
+    except Exception:
+        pass
+
+    # Allow downloads (works in headless/new-headless)
     for domain in ("Browser", "Page"):
         try:
             drv.execute_cdp_cmd(
@@ -68,41 +105,82 @@ def build_driver(headless=False, download_dir=None):  # CHANGE
     return drv
 
 
-# function will wait until the document is ready and the timeout it 30 sec. meaning it will wait for maximum 30 secound.
 def wait_ready(drv, timeout=30):
+    """Wait for document.readyState == 'complete'."""
     WebDriverWait(drv, timeout).until(
         lambda d: d.execute_script("return document.readyState") == "complete"
     )
 
 
+def is_interstitial(drv):
+    """
+    Detect common anti-bot interstitials (e.g., 'Just a moment...').
+    Headless often hits these.
+    """
+    try:
+        title = (drv.title or "").lower()
+        if "just a moment" in title:
+            return True
+        html = (drv.page_source or "").lower()
+        return ("checking your browser" in html) or ("verifying you are human" in html)
+    except Exception:
+        return False
+
+
+def wait_past_interstitial(drv, max_wait=45):
+    """Wait for interstitials to clear; refresh once if needed."""
+    deadline = time.time() + max_wait
+    refreshed = False
+    while time.time() < deadline:
+        if not is_interstitial(drv):
+            return True
+        time.sleep(1.0)
+        if not refreshed and (deadline - time.time()) < max_wait - 5:
+            try:
+                drv.refresh()
+                wait_ready(drv, timeout=20)
+            except Exception:
+                pass
+            refreshed = True
+    return not is_interstitial(drv)
+
+
 def focus_and_type_prosemirror(drv, text, timeout=25):
-    # This is waiting for driver to be ready
+    """
+    Focus the ChatGPT editor reliably (scroll + click + focus) then type and submit.
+    Falls back to a generic ProseMirror selector in headless if the id differs.
+    """
     wait = WebDriverWait(drv, timeout)
+    editor = None
 
-    # this is selecting the input (chatgpt input)
-    sel = (By.CSS_SELECTOR, "div.ProseMirror#prompt-textarea")
-    # this is checking if the sel is visible or not
-    editor = wait.until(EC.visibility_of_element_located(sel))
+    # Try the specific id first
+    try:
+        editor = wait.until(
+            EC.visibility_of_element_located(
+                (By.CSS_SELECTOR, "div.ProseMirror#prompt-textarea")
+            )
+        )
+    except Exception:
+        # Fallback for headless/variant DOMs
+        editor = wait.until(
+            EC.visibility_of_element_located(
+                (By.CSS_SELECTOR, "div.ProseMirror[contenteditable='true']")
+            )
+        )
 
-    # this is like editor[0].scrollIntoview({block: 'center'}), this will block the scroolview
     drv.execute_script("arguments[0].scrollIntoView({block:'center'});", editor)
-
-    # this will move to the element and then click on the input field and then do editor[0].focus();
     ActionChains(drv).move_to_element(editor).click().pause(0.2).perform()
     drv.execute_script("arguments[0].focus();", editor)
     try:
-        # this will send the keys meaning this will paste the message in the text editor
         editor.send_keys(text)
     except Exception:
+        # Some editors swallow send_keys sporadically — pressing Enter still triggers submit.
         pass
-
-    # This will press enter so that the messages goes
     ActionChains(drv).send_keys(Keys.ENTER).perform()
 
 
 def allow_downloads_to(drv, download_dir):
-    # Fallback (some Chrome versions ignore Page.* outside headless)
-    # this is a fallback so that the it should download only on our specified locaiton
+    """Secondary nudge for download dir (some builds ignore Page.* on first try)."""
     try:
         drv.execute_cdp_cmd(
             "Page.setDownloadBehavior",
@@ -112,9 +190,11 @@ def allow_downloads_to(drv, download_dir):
         pass
 
 
-# This is going to find the download button and if found it's going to return that button
 def find_download_button_if_ready(drv):
-    # Returns a WebElement when the newest “Image created” block has a download button
+    """
+    Return the download button from the most recent 'Image created' block if visible,
+    else None. Uses JS for speed and resilience.
+    """
     return drv.execute_script(
         """
         const isVisible = el => el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
@@ -122,7 +202,7 @@ def find_download_button_if_ready(drv):
           el => isVisible(el) && /\\bImage created\\b/i.test(el.textContent || '')
         );
         if (!blocks.length) return null;
-        const block = blocks.at(-1); //This is going to find the last most element which contain text "Image created"
+        const block = blocks.at(-1);
         block.scrollIntoView({block:'center'});
         const btnInBlock = block.querySelector('button[aria-label="Download this image"]');
         const btnAny     = document.querySelector('button[aria-label="Download this image"]');
@@ -131,13 +211,11 @@ def find_download_button_if_ready(drv):
     )
 
 
-# This will click on the given element.
 def click_js(drv, element):
+    """Click via JS; fall back to dispatching a synthetic click event."""
     try:
-        #  this is similar to element[0].click() in puppettier
         drv.execute_script("arguments[0].click()", element)
     except Exception:
-        # if the previous method fails this will work as fallback
         drv.execute_script(
             """
             const b = arguments[0];
@@ -148,59 +226,49 @@ def click_js(drv, element):
 
 
 def wait_for_new_download(dst_dir, before_set, timeout=180):
-
+    """
+    Wait until a new non-.crdownload file appears and its size stops changing.
+    Return its absolute path, else None on timeout.
+    """
     end = time.time() + timeout
     last_path, last_size, stable_ticks = None, None, 0
 
     while time.time() < end:
-
-        # Checks if there's any new files int he des_dir without (.crdownload)
-
-        # this list all the images in the dst_dir
         names = set(os.listdir(dst_dir))
-
-        # this get all new downloaded images (before set = previous image set.)
         new_files = [
             n for n in names - before_set if not n.lower().endswith(".crdownload")
         ]
 
-        # If there's a new file, and also check if the size if stable meaning downloading compleated. if compleated it's going to return path.
         if new_files:
-
-            # this is for getting the last images path
             path = max(
                 (os.path.join(dst_dir, n) for n in new_files),
                 key=lambda p: os.path.getmtime(p),
             )
-
             size = os.path.getsize(path)
 
-            # This check if files size is increasing or not if increasing that means file is downloading.
             if path == last_path and size == last_size:
                 stable_ticks += 1
             else:
                 stable_ticks, last_path, last_size = 0, path, size
-            if stable_ticks >= 4:  # ~2s at 0.5s intervals
-                # After download compleated we're going to return the file path.
+
+            if stable_ticks >= 4:  # ~2s stable (0.5s * 4)
                 return path
         time.sleep(0.5)
     return None
 
 
-# slugify("My Cool File!!") → "my-cool-file"
 def slugify(text, maxlen=64):
+    """Turn arbitrary text into a filename-safe slug."""
     text = re.sub(r"\s+", " ", text).strip().lower()
     text = re.sub(r"[^a-z0-9_-]+", "-", text)
     return (text[:maxlen] or "image").strip("-")
 
 
-# ---------- NEW: image listing & final renamer ----------
-
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}  # CHANGE
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 
 
-# ["C:/Downloads/pic1.png", "C:/Downloads/photo.jpg", ...] this function return all the images inside the dirpath
-def list_images(dirpath):  # CHANGE
+def list_images(dirpath):
+    """Return absolute paths of finished image files in dirpath."""
     return [
         os.path.join(dirpath, f)
         for f in os.listdir(dirpath)
@@ -209,20 +277,19 @@ def list_images(dirpath):  # CHANGE
     ]
 
 
-# This will ensure name like 01.jpg, 02.jpg, 03.jpg etc..
-def ensure_sequential_names(dirpath, expected_n, pad_width):  # CHANGE
+def ensure_sequential_names(dirpath, expected_n, pad_width):
     """
-    Normalize whatever is in dirpath to 01.ext..NN.ext:
-    - Preserve existing numeric names (1/01/etc.) but fix zero-padding.
-    - Assign remaining files in mtime order to remaining numbers.
+    Final cleanup: ensure files are exactly 01..NN.ext.
+    - Keep any file already named with a number (fix padding).
+    - Assign remaining files by earliest mtime.
+    - Remove extras beyond expected_n.
     """
     imgs = list_images(dirpath)
     if not imgs:
         return
 
-    # Move to temp names first to avoid collisions
     tmp_records = []  # (tmp_path, ext, mtime, orig_number or None)
-    numeric_re = re.compile(r"^(\\d+)\\.[^.]+$", re.IGNORECASE)
+    numeric_re = re.compile(r"^(\d+)\.[^.]+$", re.IGNORECASE)
 
     for p in imgs:
         folder, fname = os.path.split(p)
@@ -238,22 +305,16 @@ def ensure_sequential_names(dirpath, expected_n, pad_width):  # CHANGE
         os.replace(p, tmp)
         tmp_records.append((tmp, (ext or ".png"), os.path.getmtime(tmp), number))
 
-    # Choose file for each slot 1..expected_n
-    used = set()
     remaining = [r for r in tmp_records]
-    # Prefer files that already had the right numeric index
     for i in range(1, expected_n + 1):
-        # First: exact numeric match
         exact = [r for r in remaining if r[3] == i]
         chosen = exact[0] if exact else None
         if not chosen:
-            # Next: any numeric (wrong index) won't be preferred; pick by earliest mtime
             non_numeric = [r for r in remaining if r[3] is None]
             pool = non_numeric if non_numeric else remaining
             pool.sort(key=lambda r: r[2])  # earliest first
             chosen = pool[0]
         remaining.remove(chosen)
-        used.add(chosen[0])
 
         tmp, ext, _, _ = chosen
         num = f"{i:0{pad_width}d}"
@@ -265,7 +326,7 @@ def ensure_sequential_names(dirpath, expected_n, pad_width):  # CHANGE
             pass
         os.replace(tmp, target)
 
-    # Clean any leftovers (more files than expected_n)
+    # Remove leftovers if more files than expected_n
     for tmp, _, _, _ in remaining:
         try:
             os.remove(tmp)
@@ -273,102 +334,132 @@ def ensure_sequential_names(dirpath, expected_n, pad_width):  # CHANGE
             pass
 
 
-# ---------- Main logic ----------
+# =========================
+# Main
+# =========================
 
 
 def main(headless=False):
-
-    # This is loading image prompts from json
-    prompts = load_prompts(max_count=6)
-
+    prompts = load_prompts(max_count=MAX_PROMPTS)
     if not prompts:
-        raise RuntimeError("No prompts found in assets/info/story_image_prompts.json")
+        raise RuntimeError(f"No prompts found in {PROMPTS_JSON}")
 
-    expected_n = len(prompts)  # how many images should we wait for download
-    pad_width = max(
-        2, len(str(expected_n))
-    )  # zero-padding width 01.png / 001.png etc..
+    expected_n = len(prompts)
+    pad_width = max(2, len(str(expected_n)))  # 01.. or 001.. depending on count
 
-    root_dir = os.path.abspath("output_images")
+    root_dir = os.path.abspath(OUTPUT_DIR)
     if os.path.exists(root_dir):
         shutil.rmtree(root_dir)
     os.makedirs(root_dir, exist_ok=True)
 
     driver = None
     try:
-        driver = build_driver(headless=headless, download_dir=root_dir)  # CHANGE
-        allow_downloads_to(driver, root_dir)  # CHANGE
+        driver = build_driver(headless=headless, download_dir=root_dir)
+        allow_downloads_to(driver, root_dir)
 
-        # Track per-tab state
         tabs = []
+        orig_handle = None
 
-        # Reuse the already-open initial tab for the first prompt
-        orig_handle = driver.current_window_handle
-
-        # This will create new window, but for the first one it will use existing one and then go to chatgpt.com and wait for driver to ready  and sleep for 0.8 s and then using focus_and_type_prosemirror() it will send the message and also it will store some information about the tabs using tabs.append(),
         for i, prompt in enumerate(prompts):
-
-            # this will check if i = 0 and first windows is open or not, if opened it will use that existing window
-            if i == 0 and orig_handle in driver.window_handles:
+            if i == 0:
+                # Use the initial tab for the first prompt
+                orig_handle = driver.current_window_handle
                 handle = orig_handle
                 driver.switch_to.window(handle)
             else:
-                # This will create new tab and go to chatgopt.
+                # Open a new tab per prompt
                 driver.switch_to.new_window("tab")
                 handle = driver.current_window_handle
 
             driver.get("https://chatgpt.com/")
-            # This is checking if the webpage is ready or not.
             wait_ready(driver)
-            time.sleep(0.8)
 
-            msg = f'Please create an image based on the following prompt: "{prompt}"'
+            # Headless often lands on a 'Just a moment...' interstitial
+            if is_interstitial(driver):
+                ok = wait_past_interstitial(driver, max_wait=45)
+                if not ok:
+                    # One more try
+                    driver.refresh()
+                    wait_ready(driver)
+
+            # Type and submit the prompt
+
+            GLOBAL_ID = (
+                "[GLOBAL_IDENTITY]\n"
+                "Meera-01: widowed librarian, late 50s, South Asian, oval face, medium-brown skin, silver-streaked black hair in a low bun, thin spectacles, small gold nose stud; calm and caring.\n"
+                "Wardrobe-lock: wool shawl with a thin red edge, sea-blue cotton sari, worn leather sandals.\n"
+                "Signature props: weathered field notebook, brass thermometer, chipped blue enamel mug.\n"
+                "Ravi-01: young fisherman, mid 20s, lean, sun-browned skin, short wavy black hair, faint stubble; practical and kind.\n"
+                "Wardrobe-lock: faded teal kurta, dark lungi, old rope bracelet.\n"
+                "Setting-lock: misty South Asian coastal town, wooden pier, lotus-edged shore, hand-painted signs, no modern skyline.\n"
+                "Do-not-change: faces, ages, skin tones, hair styles, wardrobe-lock items, boat and signs styling; consistent across images.\n"
+                "Camera-lock: 35mm natural-light look, shallow depth of field, aspect ratio 3:2, subtle film grain.\n"
+            )
+            STYLE_WATERCOLOR = (
+                "[STYLE_MODULE: watercolor]\n"
+                "Transparent washes, visible paper texture, soft edges, pooled pigments at contours, limited palette with indigo/teal accents.\n"
+            )
+            STYLE_REALISTIC = (
+                "[STYLE_MODULE: realistic]\n"
+                "Soft documentary realism, natural muted palette, gentle haze, true-to-life textures, no plastic sheen.\n"
+            )
+            STYLE_CARTOON = (
+                "[STYLE_MODULE: cartoon]\n"
+                "Clean cel-shading, bold outlines, flat color blocks, gentle gradients for sky/water, expressive but not exaggerated faces.\n"
+            )
+
+            CHOSEN_STYLE = STYLE_CARTOON  # or STYLE_REALISTIC / STYLE_CARTOON per run
+
+            msg = (
+                (
+                    GLOBAL_ID
+                    + CHOSEN_STYLE
+                    + " [SCENE] "
+                    + prompt
+                    + " [OUTPUT] High resolution, aspect ratio 3:2, single-frame composition, no collage."
+                )
+                .replace("\r", " ")
+                .replace("\n", " ")
+                .strip()
+            )
+
+            # msg = f'Please create an image based on the following prompt: "{prompt}"'
             focus_and_type_prosemirror(driver, msg)
 
             tabs.append(
                 {
-                    "handle": handle,  # The browser tab ID (so the script can switch back to it later).
-                    "prompt": prompt,  # The text prompt sent to ChatGPT to generate the image.
-                    "slug": slugify(
-                        prompt
-                    ),  # A short, filename-safe version of the prompt (via slugify(prompt) — removes spaces/symbols).
-                    "index": i,  # numbering comes from prompt order
-                    "state": "waiting_button",  # waiting_button → downloading → done
-                    "before_set": None,  # Stores the list of files in the folder before clicking the download button — helps detect the new file later.
-                    "clicked_at": None,  # this is used for timeout logic
-                    "final_path": None,  # Will later hold the full file path of the downloaded image.
+                    "handle": handle,
+                    "prompt": prompt,
+                    "slug": slugify(prompt),
+                    "index": i,
+                    "state": "waiting_button",  # waiting_button -> downloading -> done
+                    "before_set": None,
+                    "clicked_at": None,
+                    "final_path": None,
                 }
             )
 
-        # Poll each tab until we either finish all, or the folder has N images (stable)
-        overall_deadline = time.time() + 60 * 30  # 30 min cap
-        stable_ticks, last_seen = 0, None  # CHANGE: global finish by file count
+        # Poll all tabs until we finish or hit a global time cap
+        overall_deadline = time.time() + 60 * 30  # 30 minutes
+        stable_ticks, last_seen = 0, None
 
         while time.time() < overall_deadline:
-            # Global stop: when we already have N images and the set is stable
-
+            # Global early-exit: stop when we already have N images and the set is stable
             current = sorted(list_images(root_dir))
-
             if len(current) >= expected_n:
                 if current == last_seen:
                     stable_ticks += 1
-                    if stable_ticks >= 3:  # ~2 seconds settle
+                    if stable_ticks >= 3:  # ~2s settle
                         break
                 else:
                     stable_ticks = 0
                     last_seen = current
 
-            # Remaining means those tabs whose steate is anything but not "done"
             remaining = [t for t in tabs if t["state"] != "done"]
-
-            # if there is no remeaning left meaning everything is "done" then break the while loop
             if not remaining:
                 break
 
-            # Here we're going to loop through all remaining tabs.
             for t in remaining:
-
-                # here t["handle"] = remaining["handle"]. remaining = tabs which is not "done";
                 driver.switch_to.window(t["handle"])
 
                 if t["state"] == "waiting_button":
@@ -380,19 +471,17 @@ def main(headless=False):
                         t["clicked_at"] = time.time()
 
                 elif t["state"] == "downloading":
-
-                    # This will return the final path of the file which has been downloaded compleatly
-                    # Increasing the timeout did actually worked!
+                    # Give downloads enough time in headless
                     final_path = wait_for_new_download(
                         root_dir, t["before_set"], timeout=200
                     )
                     if final_path:
-                        # Rename immediately to index-based name (keeps true extension)
+                        # Rename to sequential name (keeps real extension)
                         ext = os.path.splitext(final_path)[1] or ".png"
                         if not ext.startswith("."):
                             ext = f".{ext}"
                         num = f"{t['index'] + 1:0{pad_width}d}"
-                        target_path = os.path.join(root_dir, f"{num}{ext}")
+                        target_path = os.path.join(root_dir, f"{num}{ext.lower()}")
 
                         try:
                             if os.path.exists(target_path):
@@ -400,39 +489,29 @@ def main(headless=False):
                         except Exception:
                             pass
 
+                        # Replace (atomic move on same volume)
                         os.replace(final_path, target_path)
                         t["final_path"] = target_path
                         t["state"] = "done"
                     else:
                         # Per-tab timeout after click (10 min)
-                        if time.time() - t["clicked_at"] > 600:
+                        if time.time() - (t["clicked_at"] or 0) > 600:
                             t["state"] = "done"
 
             time.sleep(0.6)
 
-        # Final normalization: ensure we have 01..NN.ext exactly  # CHANGE
+        # Final pass: normalize names to exactly 01..NN.ext
         # ensure_sequential_names(root_dir, expected_n, pad_width)
 
     finally:
         if driver is not None:
-            driver.quit()  # CHANGE: always close Chrome when finished
+            driver.quit()
 
+
+# =========================
+# Entry
+# =========================
 
 if __name__ == "__main__":
-    # CHANGE: CLI switches to toggle headless mode
-    parser = argparse.ArgumentParser(description="Generate and download images.")
-    parser.add_argument(
-        "--headless",
-        action="store_true",
-        help="Run Chrome in headless mode (no visible window).",
-    )
-    parser.add_argument(
-        "--show",
-        dest="headless",
-        action="store_false",
-        help="Run with a visible Chrome window.",
-    )
-    parser.set_defaults(headless=False)
-    args = parser.parse_args()
-
-    main(headless=args.headless)  # CHANGE
+    # Toggle HEADLESS at the top; no CLI needed.
+    main(headless=HEADLESS)
