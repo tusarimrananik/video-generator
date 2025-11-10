@@ -4,6 +4,7 @@ from pathlib import Path
 
 def generate_subtitles() -> Path:
     import os
+    import re
     import json
     from typing import List
     from pydub import AudioSegment
@@ -44,30 +45,34 @@ def generate_subtitles() -> Path:
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
-    # --- Subtitle appearance defaults ---
+    # --- Subtitle appearance defaults (visuals only) ---
     playres_w = 1080
     playres_h = 1920
     font = "DejaVu Sans Mono"
     fontsize = 54
-    primary_color = "&H00FFFFFF"
-    outline_color = "&H00111111"
-    alignment = 5
+    primary_color = "&H00FFFFFF"  # white (unused by inline, kept for completeness)
+    outline_color = "&H00000000"  # black (unused by inline, kept for completeness)
+    alignment = 5  # 5 = top-center (use 2 for bottom-center)
     margin_l = 60
     margin_r = 60
     margin_v = 40
-    highlight_bg_color = "&H8033CCFF"
-    highlight_text_color = "&H00000000"
+
+    # Inline overrides (match your sample exactly)
+    inline_fs = 84
+    inline_prefix = (
+        r"{\b1\fs" + str(inline_fs) + r"\1c&HFFFFFF&\3c&H000000&\bord4\shad0}"
+    )
 
     # --- Prepare audio and segments ---
     ass_out_path.parent.mkdir(parents=True, exist_ok=True)
     duration_s = AudioSegment.from_file(audio_path).duration_seconds
     segments = [{"start": 0.0, "end": duration_s, "text": text_to_align}]
 
-    # --- Align text with WhisperX ---
+    # --- Align text with WhisperX (UNTOUCHED loading behavior) ---
     align_model, metadata = whisperx.load_align_model(language_code="en", device="cpu")
     aligned = whisperx.align(segments, align_model, metadata, str(audio_path), "cpu")
 
-    # --- Helper functions ---
+    # --- Helpers ---
     def fmt_time(t: float) -> str:
         if t < 0:
             t = 0.0
@@ -75,6 +80,15 @@ def generate_subtitles() -> Path:
         m = int((t % 3600) // 60)
         s = int(t % 60)
         cs = int(round((t - int(t)) * 100))
+        if cs >= 100:
+            cs = 0
+            s += 1
+            if s >= 60:
+                s = 0
+                m += 1
+                if m >= 60:
+                    m = 0
+                    h += 1
         return f"{h}:{m:02}:{s:02}.{cs:02}"
 
     def esc(text: str) -> str:
@@ -85,57 +99,53 @@ def generate_subtitles() -> Path:
             .replace("\n", r"\N")
         )
 
-    def has_times(w: dict) -> bool:
-        return w.get("start") is not None and w.get("end") is not None
+    # Remove ONLY trailing punctuation (keep internal apostrophes etc.)
+    # You mentioned "(, . ! etc)" — here’s a broad but end-only set.
+    trailing_punct_re = re.compile(r"""[)\]\}\.,!?:;'"“”‘’\-–—…]+$""")
 
-    def q2(text: str) -> str:
-        return r"{\q2}" + text
+    def strip_trailing_punct(token: str) -> str:
+        return trailing_punct_re.sub("", token)
 
-    # --- ASS file header ---
+    # --- ASS file header (single style 'HL'; actual look via inline overrides) ---
     header = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
+        "WrapStyle: 2\n"
         f"PlayResX:{playres_w}\n"
         f"PlayResY:{playres_h}\n\n"
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, "
         "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Base,{font},{fontsize},{primary_color},&H000000FF,{outline_color},&H64000000,"
-        f"0,0,0,0,100,100,0,0,1,3,0,{alignment},{margin_l},{margin_r},{margin_v},1\n"
-        f"Style: HL,{font},{fontsize},{highlight_text_color},&H000000FF,&H00000000,{highlight_bg_color},"
-        f"0,0,0,0,100,100,0,0,3,0,0,{alignment},{margin_l},{margin_r},{margin_v},1\n\n"
+        # Keep a simple HL style; inline tags will override size/color/bold/outline.
+        f"Style: HL,{font},{fontsize},{primary_color},&H000000FF,{outline_color},&H00000000,"
+        f"0,0,0,0,100,100,0,0,1,3,0,{alignment},{margin_l},{margin_r},{margin_v},1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
 
     lines: List[str] = [header]
 
-    # --- Write subtitles ---
+    # --- WORD-LEVEL ONLY: one Dialogue per word, with inline styling and no trailing punctuation ---
     for seg in aligned.get("segments", []):
-        words = [w for w in seg.get("words", []) if has_times(w)]
-        if not words:
-            continue
-        display_tokens = [
-            str(w.get("word", "")).strip()
-            for w in words
-            if str(w.get("word", "")).strip()
-        ]
-        base_text = " ".join(display_tokens)
-        if base_text:
-            lines.append(
-                f"Dialogue:0,{fmt_time(seg['start'])},{fmt_time(seg['end'])},Base,,{margin_l},{margin_r},{margin_v},,{q2(esc(base_text))}\n"
-            )
-        for i, w in enumerate(words):
-            token = str(w.get("word", "")).strip()
-            if not token:
+        for w in seg.get("words", []):
+            if w.get("start") is None or w.get("end") is None:
                 continue
-            pad_len = len(" ".join(display_tokens[:i])) + (1 if i > 0 else 0)
-            overlay_text = (" " * pad_len) + token
+            raw = str(w.get("word", "")).strip()
+            if not raw:
+                continue
+            token = strip_trailing_punct(raw).upper()
+            if not token:
+                # token was only punctuation at the end; skip
+                continue
             lines.append(
-                f"Dialogue:1,{fmt_time(float(w['start']))},{fmt_time(float(w['end']))},HL,,{margin_l},{margin_r},{margin_v},,{q2(esc(overlay_text))}\n"
+                f"Dialogue: 1,{fmt_time(float(w['start']))},{fmt_time(float(w['end']))},HL,,"
+                f"{margin_l},{margin_r},{margin_v},,"
+                f"{inline_prefix}{esc(token)}\n"
             )
 
     ass_out_path.write_text("".join(lines), encoding="utf-8")
-    print(f"✅ Subtitles generated successfully: {ass_out_path.resolve()}")
+    print(
+        f"✅ Word-level subtitles written (no trailing punctuation): {ass_out_path.resolve()}"
+    )
     return ass_out_path

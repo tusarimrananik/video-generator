@@ -20,7 +20,7 @@ PathLike = Union[str, Path]
 
 # ===== Defaults =====
 IMAGE_DIR = Path("assets/images")
-AUDIO_PATH = Path("assets/audio/generated/output.wav")
+AUDIO_PATH = Path("assets/audio/generated/mix.wav")
 OUTPUT_DIR = Path("assets/video")
 OUTPUT_PATH = OUTPUT_DIR / "output.mp4"
 
@@ -28,27 +28,35 @@ OUTPUT_PATH = OUTPUT_DIR / "output.mp4"
 # ==================== CONFIG ====================
 @dataclass
 class SlideshowParams:
+    # Canvas
     target_w: int = 1080
     target_h: int = 1920
-    fps: int = 30                    # smoother for shorts
+    fps: int = 30  # smoother for shorts
     min_per_image: float = 3.0
-    whip_max: float = 0.45           # max crossfade duration cap
+    whip_max: float = 0.45  # max crossfade duration cap (re-enabled)
 
-    # Look / motion
-    contrast: float = 1.08
+    # Look / motion (gentle Ken Burns defaults)
+    contrast: float = 1.00  # neutral (no tone change)
+    lum: float = 0.0  # neutral (no tone change)
     zoom_start: float = 1.00
-    zoom_end_even: float = 1.06
-    zoom_end_odd: float = 1.08
-
-    # Global fades
+    zoom_end_even: float = 1.12  # was 1.06
+    zoom_end_odd: float = 1.15  # was 1.08
+    # Global fades (subtle)
     global_fade_in_cap: float = 0.30
     global_fade_out_cap: float = 0.25
     global_fade_in_frac: float = 0.15
     global_fade_out_frac: float = 0.12
 
     # Robustness against edge artifacts / black bars
-    overscan: float = 1.003          # ~0.3% overscale
-    safety_min_body: float = 0.4     # min visible body per image (ex-fade)
+    overscan: float = 1.003  # ~0.3% overscale
+    safety_min_body: float = 0.4  # min visible body per image (ex-fade)
+
+    # Encoding color tags (explicit BT.709 + full-range for photo parity)
+    colorspace: str = "bt709"
+    color_primaries: str = "bt709"
+    color_trc: str = "bt709"
+    # "pc" (full range 0–255) ensures photos look the same in video
+    color_range: str = "pc"  # "tv" (limited) or "pc" (full)
 
 
 # ==================== HELPERS ====================
@@ -113,10 +121,11 @@ def _make_clip(
     cover_scale = max(p.target_w / base0.w, p.target_h / base0.h) * p.overscan
     base = base0.resized(cover_scale)  # v2: resized()
 
-    # Subtle contrast pop (v2: with_effects + class-based fx)
-    base = base.with_effects([
-        vfx.LumContrast(lum=0, contrast=p.contrast, contrast_threshold=128)
-    ])
+    # Tone control only if requested (defaults are neutral -> no change)
+    if (p.lum != 0.0) or (abs(p.contrast - 1.0) > 1e-6):
+        base = base.with_effects(
+            [vfx.LumContrast(lum=p.lum, contrast=p.contrast, contrast_threshold=128)]
+        )
 
     def z_func(t: float) -> float:
         prog = t / max(duration, 1e-6)
@@ -132,7 +141,6 @@ def _make_clip(
         return (w, h)
 
     zoomed = base.resized(size_func).with_position("center")  # v2: resized()
-
     comp = CompositeVideoClip([zoomed], size=(p.target_w, p.target_h))
     comp = comp.with_duration(duration)
     return comp
@@ -164,7 +172,10 @@ def _build_video_core(
 
         gi = min(p.global_fade_in_cap, per_img_final * p.global_fade_in_frac)
         go = min(p.global_fade_out_cap, per_img_final * p.global_fade_out_frac)
-        video = video.with_effects([vfx.FadeIn(gi), vfx.FadeOut(go)])
+        if gi > 0:
+            video = video.with_effects([vfx.FadeIn(gi)])
+        if go > 0:
+            video = video.with_effects([vfx.FadeOut(go)])
 
         total_quant = quantize_time_to_frame(total_audio, p.fps)
         return video.with_audio(audio_clip).with_duration(total_quant)
@@ -201,10 +212,43 @@ def _build_video_core(
 
     gi = min(p.global_fade_in_cap, per_img_final * p.global_fade_in_frac)
     go = min(p.global_fade_out_cap, per_img_final * p.global_fade_out_frac)
-    video = video.with_effects([vfx.FadeIn(gi), vfx.FadeOut(go)])
+    if gi > 0:
+        video = video.with_effects([vfx.FadeIn(gi)])
+    if go > 0:
+        video = video.with_effects([vfx.FadeOut(go)])
 
     total_quant = quantize_time_to_frame(total_audio, p.fps)
     return video.with_audio(audio_clip).with_duration(total_quant)
+
+
+# ==================== ENCODING HELPERS ====================
+def _ffmpeg_color_params(p: SlideshowParams) -> List[str]:
+    """
+    Build ffmpeg/x264 color tagging params. We tag streams with BT.709 and
+    explicit range to avoid player misinterpretation (dark/crushed look).
+    """
+    params = [
+        "-pix_fmt",
+        "yuv420p",  # widest phone compatibility
+        "-colorspace",
+        p.colorspace,  # bt709
+        "-color_primaries",
+        p.color_primaries,  # bt709
+        "-color_trc",
+        p.color_trc,  # bt709
+    ]
+
+    # Tag range for container/stream
+    if p.color_range in ("tv", "pc"):
+        params += ["-color_range", p.color_range]
+
+    # x264-specific signaling (helps some players honor flags)
+    fullrange = "on" if p.color_range == "pc" else "off"
+    params += [
+        "-x264-params",
+        f"colorprim=bt709:transfer=bt709:colormatrix=bt709:fullrange={fullrange}",
+    ]
+    return params
 
 
 # ==================== PUBLIC API (writes file) ====================
@@ -216,19 +260,22 @@ def build_video() -> str:
     images = _collect_images(IMAGE_DIR)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Full-range output, gentle zoom, smooth crossfades, subtle global fades
+    params = SlideshowParams()
+
     audio_clip = AudioFileClip(str(AUDIO_PATH))
     try:
-        video = _build_video_core(images, audio_clip, SlideshowParams())
+        video = _build_video_core(images, audio_clip, params)
         try:
             video.write_videofile(
                 str(OUTPUT_PATH),
-                fps=SlideshowParams().fps,
+                fps=params.fps,
                 codec="libx264",
                 audio_codec="aac",
                 preset="medium",
                 threads=4,
                 bitrate="8000k",
-                ffmpeg_params=["-pix_fmt", "yuv420p"],  # safest for phone players
+                ffmpeg_params=_ffmpeg_color_params(params),
             )
         finally:
             try:
